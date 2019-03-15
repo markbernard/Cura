@@ -46,12 +46,10 @@ class Toolbox(QObject, Extension):
         self._download_reply = None  # type: Optional[QNetworkReply]
         self._download_progress = 0  # type: float
         self._is_downloading = False  # type: bool
-        self._network_manager = None  # type: Optional[QNetworkAccessManager]
-        self._request_headers = [] # type: List[Tuple[bytes, bytes]]
+        self._request_headers = dict()  # type: Dict[str, str]
         self._updateRequestHeader()
 
-
-        self._request_urls = {}  # type: Dict[str, QUrl]
+        self._request_urls = {}  # type: Dict[str, str]
         self._to_update = []  # type: List[str] # Package_ids that are waiting to be updated
         self._old_plugin_ids = set()  # type: Set[str]
         self._old_plugin_metadata = dict()  # type: Dict[str, Dict[str, Any]]
@@ -126,20 +124,15 @@ class Toolbox(QObject, Extension):
     uninstallVariablesChanged = pyqtSignal()
 
     def _updateRequestHeader(self):
-        self._request_headers = [
-            (b"User-Agent",
-            str.encode(
-                "%s/%s (%s %s)" % (
-                    self._application.getApplicationName(),
-                    self._application.getVersion(),
-                    platform.system(),
-                    platform.machine(),
-                )
-            ))
-        ]
+        self._request_headers = {
+            "User-Agent": "%s/%s (%s %s)" % (self._application.getApplicationName(),
+                                             self._application.getVersion(),
+                                             platform.system(),
+                                             platform.machine())
+        }
         access_token = self._application.getCuraAPI().account.accessToken
         if access_token:
-            self._request_headers.append((b"Authorization", "Bearer {}".format(access_token).encode()))
+            self._request_headers["Authorization"] = "Bearer {}".format(access_token)
 
     def _resetUninstallVariables(self) -> None:
         self._package_id_to_uninstall = None  # type: Optional[str]
@@ -149,13 +142,12 @@ class Toolbox(QObject, Extension):
 
     @pyqtSlot(str, int)
     def ratePackage(self, package_id: str, rating: int) -> None:
-        url = QUrl("{base_url}/packages/{package_id}/ratings".format(base_url=self._api_url, package_id = package_id))
+        url = "{base_url}/packages/{package_id}/ratings".format(base_url=self._api_url, package_id = package_id)
 
-        self._rate_request = QNetworkRequest(url)
-        for header_name, header_value in self._request_headers:
-            cast(QNetworkRequest, self._rate_request).setRawHeader(header_name, header_value)
         data = "{\"data\": {\"cura_version\": \"%s\", \"rating\": %i}}" % (Version(self._application.getVersion()), rating)
-        self._rate_reply = cast(QNetworkAccessManager, self._network_manager).put(self._rate_request, data.encode())
+
+        self._application.getHttpNetworkRequestManager().put(url, headers_dict = self._request_headers,
+                                                             data = data.encode())
 
     @pyqtSlot(result = str)
     def getLicenseDialogPluginName(self) -> str:
@@ -186,22 +178,12 @@ class Toolbox(QObject, Extension):
             sdk_version = self._sdk_version
         )
         self._request_urls = {
-            "authors": QUrl("{base_url}/authors".format(base_url = self._api_url)),
-            "packages": QUrl("{base_url}/packages".format(base_url = self._api_url))
+            "authors": "{base_url}/authors".format(base_url = self._api_url),
+            "packages": "{base_url}/packages".format(base_url = self._api_url)
         }
 
     @pyqtSlot()
     def browsePackages(self) -> None:
-        # Create the network manager:
-        # This was formerly its own function but really had no reason to be as
-        # it was never called more than once ever.
-        if self._network_manager is not None:
-            self._network_manager.finished.disconnect(self._onRequestFinished)
-            self._network_manager.networkAccessibleChanged.disconnect(self._onNetworkAccessibleChanged)
-        self._network_manager = QNetworkAccessManager()
-        self._network_manager.finished.connect(self._onRequestFinished)
-        self._network_manager.networkAccessibleChanged.connect(self._onNetworkAccessibleChanged)
-
         # Make remote requests:
         self._makeRequestByType("packages")
         self._makeRequestByType("authors")
@@ -551,11 +533,56 @@ class Toolbox(QObject, Extension):
     # --------------------------------------------------------------------------
     def _makeRequestByType(self, request_type: str) -> None:
         Logger.log("i", "Requesting %s metadata from server.", request_type)
-        request = QNetworkRequest(self._request_urls[request_type])
-        for header_name, header_value in self._request_headers:
-            request.setRawHeader(header_name, header_value)
-        if self._network_manager:
-            self._network_manager.get(request)
+        url = self._request_urls[request_type]
+
+        callback = lambda r, rt = request_type: self._onAuthorsDataRequestFinished(rt, r)
+        error_callback = lambda r, e, rt = request_type: self._onAuthorsDataRequestFinished(rt, r, e)
+        self._application.getHttpNetworkRequestManager().get(url,
+                                                             callback = callback,
+                                                             error_callback = error_callback)
+
+    def _onAuthorsDataRequestFinished(self, request_type: str,
+                                      reply: "QNetworkReply",
+                                      error: Optional["QNetworkReply.NetworkError"] = None) -> None:
+        if error is not None or reply.attribute(QNetworkRequest.HttpStatusCodeAttribute) != 200:
+            Logger.log("w",
+                       "Unable to connect with the server, we got a response code %s while trying to connect to %s",
+                       reply.attribute(QNetworkRequest.HttpStatusCodeAttribute), reply.url())
+            self.setViewPage("errored")
+            return
+
+        try:
+            json_data = json.loads(bytes(reply.readAll()).decode("utf-8"))
+
+            # Check for errors:
+            if "errors" in json_data:
+                for error in json_data["errors"]:
+                    Logger.log("e", "%s", error["title"])
+                return
+
+            # Create model and apply metadata:
+            if not self._models[request_type]:
+                Logger.log("e", "Could not find the %s model.", request_type)
+                return
+
+            self._server_response_data[request_type] = json_data["data"]
+            self._models[request_type].setMetadata(self._server_response_data[request_type])
+
+            if request_type == "packages":
+                self._models[request_type].setFilter({"type": "plugin"})
+                self.reBuildMaterialsModels()
+                self.reBuildPluginsModels()
+            elif request_type == "authors":
+                self._models[request_type].setFilter({"package_types": "material"})
+                self._models[request_type].setFilter({"tags": "generic"})
+
+            self.metadataChanged.emit()
+
+            if self.isLoadingComplete():
+                self.setViewPage("overview")
+
+        except json.decoder.JSONDecodeError:
+            Logger.log("w", "Received invalid JSON for %s.", request_type)
 
     @pyqtSlot(str)
     def startDownload(self, url: str) -> None:
@@ -570,6 +597,9 @@ class Toolbox(QObject, Extension):
             cast(QNetworkRequest, self._download_request).setAttribute(QNetworkRequest.RedirectPolicyAttribute, True)
         for header_name, header_value in self._request_headers:
             cast(QNetworkRequest, self._download_request).setRawHeader(header_name, header_value)
+
+        self._do
+
         self._download_reply = cast(QNetworkAccessManager, self._network_manager).get(self._download_request)
         self.setDownloadProgress(0)
         self.setIsDownloading(True)
